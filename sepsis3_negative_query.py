@@ -1,7 +1,6 @@
 from typing import List
 
-
-def positive_signal_query(sepsis3_table:str,
+def negative_signal_query(sepsis3_table:str,
                           specimens: List[str],
                           icu_name: str,
                           arterial_items: List[str],
@@ -28,28 +27,39 @@ def positive_signal_query(sepsis3_table:str,
         return ", ".join(map(str, lst))
     
     query = f"""
-        WITH vital_events AS (
+        WITH
+        all_stays AS (
+            SELECT stay_id, subject_id, intime, outtime
+            FROM `{icu_name}.icustays`
+        ),
+        positive_stays AS (
+            SELECT DISTINCT stay_id
+            FROM `{sepsis3_table}`
+            WHERE specimen IN UNNEST({specimens})
+        ),
+        negative_stays AS (
+            SELECT a.stay_id, a.intime AS reference_time
+            FROM all_stays a
+            LEFT JOIN positive_stays p
+                ON a.stay_id = p.stay_id
+            WHERE p.stay_id IS NULL
+            AND TIMESTAMP_DIFF(a.outtime, a.intime, MINUTE) >= 180 -- at least 3 hours stay
+        ),
+        vital_events AS (
             -- ---------------------------------
-            -- Raw vital events for positive stays
+            -- Raw vital events for negative stays
             -- ---------------------------------
             SELECT
-                SAFE_CAST(s.stay_id AS INT64) AS stay_id,
-                s.sofa_time AS onset_time,
+                SAFE_CAST(n.stay_id AS INT64) AS stay_id,
+                n.reference_time AS onset_time,   -- pseudo-onset for negative stays
                 ce.charttime,
                 ce.valuenum,
-                
-                -- Minutes relative to onset
-                TIMESTAMP_DIFF(
-                    TIMESTAMP(ce.charttime),
-                    TIMESTAMP(s.sofa_time),
-                    MINUTE
-                ) AS minutes_from_onset,
 
                 -- 15-min onset-aligned bin index
                 FLOOR(
                     TIMESTAMP_DIFF(
                         TIMESTAMP(ce.charttime),
-                        TIMESTAMP(s.sofa_time),
+                        TIMESTAMP(n.reference_time),
                         MINUTE
                     )/{bin_size}
                 ) AS bin_index,
@@ -58,18 +68,13 @@ def positive_signal_query(sepsis3_table:str,
                     WHEN ce.itemid IN ({sql_in_list(arterial_items)}) THEN 'arterial'
                     WHEN ce.itemid IN ({sql_in_list(cuff_items)}) THEN 'cuff'
                 END AS modality
-            FROM `{sepsis3_table}` s
+            FROM negative_stays n
             JOIN `{icu_name}.chartevents` ce
-                ON s.stay_id = ce.stay_id
+                ON n.stay_id = ce.stay_id
             WHERE ce.itemid IN ({sql_in_list(arterial_items + cuff_items)})
                 AND ce.valuenum IS NOT NULL
                 AND ce.valuenum BETWEEN {min_value} AND {max_value}
-                AND s.specimen IN UNNEST({specimens})
-                AND TIMESTAMP_DIFF(
-                    TIMESTAMP(ce.charttime),
-                    TIMESTAMP(s.sofa_time),
-                    MINUTE
-                ) <= 0
+                
         ),
         first_vital_time AS (
             -- ---------------------------------
@@ -89,14 +94,7 @@ def positive_signal_query(sepsis3_table:str,
                 e.*
             FROM vital_events e
             JOIN first_vital_time f
-                ON e.stay_id = f.stay_id
-            WHERE e.charttime BETWEEN
-                    -- GREATEST(
-                    --     DATETIME_SUB(DATETIME(e.onset_time), INTERVAL {lookback} HOUR),
-                    --    f.first_data_time
-                    --)
-                    f.first_data_time
-                    AND DATETIME(e.onset_time)
+                ON e.stay_id = f.stay_id            
         ),
         vital_modality_bins AS (
             -- ---------------------------------
@@ -173,7 +171,7 @@ def positive_signal_query(sepsis3_table:str,
                     TIMESTAMP_DIFF(TIMESTAMP(vital.last_time), TIMESTAMP(vital.first_time), SECOND)
                 ) AS slope,
 
-                TIMESTAMP_DIFF(TIMESTAMP(onset_time), TIMESTAMP(vital.last_time), MINUTE) AS minutes_from_onset,
+                TIMESTAMP_DIFF(TIMESTAMP(vital.last_time), TIMESTAMP(onset_time), MINUTE) AS minutes_from_onset,
 
                 CASE vital.modality
                     WHEN 'arterial' THEN 1
@@ -182,7 +180,7 @@ def positive_signal_query(sepsis3_table:str,
 
                 LAG(vital.last_val) OVER (PARTITION BY stay_id ORDER BY bin_index) AS prev_last_val,
                 vital.last_val - LAG(vital.last_val) OVER (PARTITION BY stay_id ORDER BY bin_index) AS delta_last,
-                1 AS label
+                0 AS label
             FROM vital_fused_bins
             JOIN (
                 SELECT DISTINCT stay_id, onset_time
@@ -191,16 +189,16 @@ def positive_signal_query(sepsis3_table:str,
         )
         SELECT *
         FROM final
-        WHERE minutes_from_onset >= 0   -- no leakage safety
+        WHERE minutes_from_onset >= 0 
         ORDER BY stay_id, bin_index;
     """
     
     return query
 
 
-def positive_temp_query(sepsis3_table:str,
+def negative_temp_query(sepsis3_table:str,
                           specimens: List[str],
-                          icu_name: str,                          
+                          icu_name: str,                                  
                           bin_size: int=15):
     """_summary_
 
@@ -209,15 +207,33 @@ def positive_temp_query(sepsis3_table:str,
         specimens (List[str]): _description_
         icu_name (str): _description_
         bin_size (int, optional): _description_. Defaults to 15.
-    """
+    """        
     query = f"""
-        WITH vital_events AS (
+        WITH
+        all_stays AS (
+            SELECT stay_id, subject_id, intime, outtime
+            FROM `{icu_name}.icustays`
+        ),
+        positive_stays AS (
+            SELECT DISTINCT stay_id
+            FROM `{sepsis3_table}`
+            WHERE specimen IN UNNEST({specimens})
+        ),
+        negative_stays AS (
+            SELECT a.stay_id, a.intime AS reference_time
+            FROM all_stays a
+            LEFT JOIN positive_stays p
+                ON a.stay_id = p.stay_id
+            WHERE p.stay_id IS NULL
+            AND TIMESTAMP_DIFF(a.outtime, a.intime, MINUTE) >= 180 -- at least 3 hours stay
+        ),
+        vital_events AS (
             -- ---------------------------------
-            -- Raw vital events for positive stays
+            -- Raw vital events for negative stays
             -- ---------------------------------
             SELECT
-                SAFE_CAST(s.stay_id AS INT64) AS stay_id,
-                s.sofa_time AS onset_time,
+                SAFE_CAST(n.stay_id AS INT64) AS stay_id,
+                n.reference_time AS onset_time,   -- pseudo-onset for negative stays
                 ce.charttime,
                 CASE
                     WHEN ce.itemid = 223762 THEN ce.valuenum
@@ -225,18 +241,11 @@ def positive_temp_query(sepsis3_table:str,
                     WHEN ce.itemid = 223761 THEN (ce.valuenum - 32) * 5 / 9
                 END AS valuenum,
 
-                -- Minutes relative to onset
-                TIMESTAMP_DIFF(
-                    TIMESTAMP(ce.charttime),
-                    TIMESTAMP(s.sofa_time),
-                    MINUTE
-                ) AS minutes_from_onset,
-
                 -- 15-min onset-aligned bin index
                 FLOOR(
                     TIMESTAMP_DIFF(
                         TIMESTAMP(ce.charttime),
-                        TIMESTAMP(s.sofa_time),
+                        TIMESTAMP(n.reference_time),
                         MINUTE
                     )/{bin_size}
                 ) AS bin_index,
@@ -247,15 +256,14 @@ def positive_temp_query(sepsis3_table:str,
                     WHEN ce.itemid = 223761 THEN 'tempf'
                 END AS modality
                 
-            FROM `{sepsis3_table}` s
+            FROM negative_stays n
             JOIN `{icu_name}.chartevents` ce
-                ON s.stay_id = ce.stay_id
+                ON n.stay_id = ce.stay_id
             WHERE ce.valuenum IS NOT NULL
                 AND ((ce.itemid IN (223762, 226329) AND ce.valuenum BETWEEN 10 AND 50)
                     OR
                     (ce.itemid = 223761 AND ce.valuenum BETWEEN 70 AND 120)
-                )
-                AND s.specimen IN UNNEST({specimens})
+                )                
         ),
         first_vital_time AS (
             -- ---------------------------------
@@ -275,10 +283,7 @@ def positive_temp_query(sepsis3_table:str,
                 e.*
             FROM vital_events e
             JOIN first_vital_time f
-                ON e.stay_id = f.stay_id
-            WHERE e.charttime BETWEEN                    
-                    f.first_data_time
-                    AND DATETIME(e.onset_time)
+                ON e.stay_id = f.stay_id            
         ),
         vital_modality_bins AS (
             -- ---------------------------------
@@ -356,7 +361,7 @@ def positive_temp_query(sepsis3_table:str,
                     TIMESTAMP_DIFF(TIMESTAMP(vital.last_time), TIMESTAMP(vital.first_time), SECOND)
                 ) AS slope,
 
-                TIMESTAMP_DIFF(TIMESTAMP(onset_time), TIMESTAMP(vital.last_time), MINUTE) AS minutes_from_onset,
+                TIMESTAMP_DIFF(TIMESTAMP(vital.last_time), TIMESTAMP(onset_time), MINUTE) AS minutes_from_onset,
 
                 CASE vital.modality
                     WHEN 'blood' THEN 1
@@ -366,7 +371,7 @@ def positive_temp_query(sepsis3_table:str,
 
                 LAG(vital.last_val) OVER (PARTITION BY stay_id ORDER BY bin_index) AS prev_last_val,
                 vital.last_val - LAG(vital.last_val) OVER (PARTITION BY stay_id ORDER BY bin_index) AS delta_last,
-                1 AS label
+                0 AS label
             FROM vital_fused_bins
             JOIN (
                 SELECT DISTINCT stay_id, onset_time
@@ -375,9 +380,8 @@ def positive_temp_query(sepsis3_table:str,
         )
         SELECT *
         FROM final
-        WHERE minutes_from_onset >= 0   -- no leakage safety
+        WHERE minutes_from_onset >= 0 
         ORDER BY stay_id, bin_index;
     """
     
     return query
-
